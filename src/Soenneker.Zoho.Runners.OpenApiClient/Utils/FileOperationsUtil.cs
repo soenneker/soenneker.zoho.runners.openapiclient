@@ -1,4 +1,3 @@
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.OpenApi;
 using Soenneker.Extensions.String;
@@ -11,7 +10,6 @@ using Soenneker.Utils.Directory.Abstract;
 using Soenneker.Utils.Dotnet.Abstract;
 using Soenneker.Utils.Environment;
 using Soenneker.Utils.File.Abstract;
-using Soenneker.Utils.Process.Abstract;
 using Soenneker.Zoho.Runners.OpenApiClient.Utils.Abstract;
 using System;
 using System.Collections.Generic;
@@ -22,28 +20,23 @@ using System.Threading.Tasks;
 
 namespace Soenneker.Zoho.Runners.OpenApiClient.Utils;
 
-///<inheritdoc cref="IFileOperationsUtil"/>
 public sealed class FileOperationsUtil : IFileOperationsUtil
 {
     private readonly ILogger<FileOperationsUtil> _logger;
-    private readonly IConfiguration _configuration;
     private readonly IGitUtil _gitUtil;
     private readonly IDotnetUtil _dotnetUtil;
-    private readonly IProcessUtil _processUtil;
     private readonly IKiotaUtil _kiotaUtil;
     private readonly IFileUtil _fileUtil;
     private readonly IDirectoryUtil _directoryUtil;
     private readonly IOpenApiMerger _openApiMerger;
     private readonly IOpenApiFixer _openApiFixer;
 
-    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IConfiguration configuration, IGitUtil gitUtil, IDotnetUtil dotnetUtil,
-        IProcessUtil processUtil, IFileUtil fileUtil, IDirectoryUtil directoryUtil, IOpenApiMerger openApiMerger, IKiotaUtil kiotaUtil, IOpenApiFixer openApiFixer)
+    public FileOperationsUtil(ILogger<FileOperationsUtil> logger, IGitUtil gitUtil, IDotnetUtil dotnetUtil, IFileUtil fileUtil,
+        IDirectoryUtil directoryUtil, IOpenApiMerger openApiMerger, IKiotaUtil kiotaUtil, IOpenApiFixer openApiFixer)
     {
         _logger = logger;
-        _configuration = configuration;
         _gitUtil = gitUtil;
         _dotnetUtil = dotnetUtil;
-        _processUtil = processUtil;
         _kiotaUtil = kiotaUtil;
         _fileUtil = fileUtil;
         _directoryUtil = directoryUtil;
@@ -53,6 +46,10 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
 
     public async ValueTask Process(CancellationToken cancellationToken = default)
     {
+        string gitHubToken = EnvironmentUtil.GetVariableStrict("GH__TOKEN");
+        string name = EnvironmentUtil.GetVariableStrict("GIT__NAME");
+        string email = EnvironmentUtil.GetVariableStrict("GIT__EMAIL");
+
         string gitDirectory = await _gitUtil.CloneToTempDirectory($"https://github.com/soenneker/{Constants.Library.ToLowerInvariantFast()}",
             cancellationToken: cancellationToken);
 
@@ -78,7 +75,7 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
 
         await _kiotaUtil.Generate(fixedFilePath, "ZohoOpenApiClient", Constants.Library, gitDirectory, cancellationToken).NoSync();
 
-        await BuildAndPush(gitDirectory, cancellationToken)
+        await BuildAndPush(gitDirectory, gitHubToken, name, email, cancellationToken)
             .NoSync();
     }
 
@@ -91,58 +88,32 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
     public async ValueTask DeleteAllExceptCsproj(string directoryPath, CancellationToken cancellationToken = default)
     {
         if (!(await _directoryUtil.Exists(directoryPath, cancellationToken)))
-        {
-            _logger.LogWarning("Directory does not exist: {DirectoryPath}", directoryPath);
-            return;
-        }
+            throw new DirectoryNotFoundException($"Generated source directory does not exist: {directoryPath}");
 
-        try
+        List<string> files = await _directoryUtil.GetFilesByExtension(directoryPath, "", true, cancellationToken);
+        foreach (string file in files)
         {
-            // Delete all files except .csproj
-            List<string> files = await _directoryUtil.GetFilesByExtension(directoryPath, "", true, cancellationToken);
-            foreach (string file in files)
+            if (!file.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
             {
-                if (!file.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        await _fileUtil.Delete(file, ignoreMissing: true, log: false, cancellationToken);
-                        _logger.LogInformation("Deleted file: {FilePath}", file);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Failed to delete file: {FilePath}", file);
-                    }
-                }
-            }
-
-            // Delete all empty subdirectories
-            List<string> dirs = await _directoryUtil.GetAllDirectoriesRecursively(directoryPath, cancellationToken);
-            foreach (string dir in dirs.OrderByDescending(d => d.Length)) // Sort by depth to delete from deepest first
-            {
-                try
-                {
-                    List<string> dirFiles = await _directoryUtil.GetFilesByExtension(dir, "", false, cancellationToken);
-                    List<string> subDirs = await _directoryUtil.GetAllDirectories(dir, cancellationToken);
-                    if (dirFiles.Count == 0 && subDirs.Count == 0)
-                    {
-                        await _directoryUtil.Delete(dir, cancellationToken);
-                        _logger.LogInformation("Deleted empty directory: {DirectoryPath}", dir);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to delete directory: {DirectoryPath}", dir);
-                }
+                await _fileUtil.Delete(file, ignoreMissing: true, log: false, cancellationToken);
+                _logger.LogInformation("Deleted file: {FilePath}", file);
             }
         }
-        catch (Exception ex)
+
+        List<string> dirs = await _directoryUtil.GetAllDirectoriesRecursively(directoryPath, cancellationToken);
+        foreach (string dir in dirs.OrderByDescending(d => d.Length))
         {
-            _logger.LogError(ex, "An error occurred while cleaning the directory: {DirectoryPath}", directoryPath);
+            List<string> dirFiles = await _directoryUtil.GetFilesByExtension(dir, "", false, cancellationToken);
+            List<string> subDirs = await _directoryUtil.GetAllDirectories(dir, cancellationToken);
+            if (dirFiles.Count == 0 && subDirs.Count == 0)
+            {
+                await _directoryUtil.Delete(dir, cancellationToken);
+                _logger.LogInformation("Deleted empty directory: {DirectoryPath}", dir);
+            }
         }
     }
 
-    private async ValueTask BuildAndPush(string gitDirectory, CancellationToken cancellationToken)
+    private async ValueTask BuildAndPush(string gitDirectory, string gitHubToken, string name, string email, CancellationToken cancellationToken)
     {
         string projFilePath = Path.Combine(gitDirectory, "src", Constants.Library, $"{Constants.Library}.csproj");
 
@@ -151,15 +122,7 @@ public sealed class FileOperationsUtil : IFileOperationsUtil
         bool successful = await _dotnetUtil.Build(projFilePath, true, "Release", false, cancellationToken: cancellationToken);
 
         if (!successful)
-        {
-            _logger.LogError("Build was not successful, exiting...");
-            return;
-        }
-
-        string gitHubToken = EnvironmentUtil.GetVariableStrict("GH__TOKEN");
-
-        string name = EnvironmentUtil.GetVariableStrict("GIT__NAME");
-        string email = EnvironmentUtil.GetVariableStrict("GIT__EMAIL");
+            throw new InvalidOperationException("The generated Zoho OpenAPI client did not build successfully.");
 
         await _gitUtil.CommitAndPush(gitDirectory, "Automated update", gitHubToken, name, email, cancellationToken);
     }
